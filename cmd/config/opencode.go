@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -11,8 +12,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/internal/modelref"
 )
 
 // OpenCode implements Runner and Editor for OpenCode integration
@@ -24,33 +25,11 @@ type cloudModelLimit struct {
 	Output  int
 }
 
-// cloudModelLimits maps cloud model base names to their token limits.
-// TODO(parthsareen): grab context/output limits from model info instead of hardcoding
-var cloudModelLimits = map[string]cloudModelLimit{
-	"cogito-2.1:671b":     {Context: 163_840, Output: 65_536},
-	"deepseek-v3.1:671b":  {Context: 163_840, Output: 163_840},
-	"deepseek-v3.2":       {Context: 163_840, Output: 65_536},
-	"glm-4.6":             {Context: 202_752, Output: 131_072},
-	"glm-4.7":             {Context: 202_752, Output: 131_072},
-	"gpt-oss:120b":        {Context: 131_072, Output: 131_072},
-	"gpt-oss:20b":         {Context: 131_072, Output: 131_072},
-	"kimi-k2:1t":          {Context: 262_144, Output: 262_144},
-	"kimi-k2.5":           {Context: 262_144, Output: 262_144},
-	"kimi-k2-thinking":    {Context: 262_144, Output: 262_144},
-	"nemotron-3-nano:30b": {Context: 1_048_576, Output: 131_072},
-	"qwen3-coder:480b":    {Context: 262_144, Output: 65_536},
-	"qwen3-coder-next":    {Context: 262_144, Output: 32_768},
-	"qwen3-next:80b":      {Context: 262_144, Output: 32_768},
-}
-
 // lookupCloudModelLimit returns the token limits for a cloud model.
-// It tries the exact name first, then strips the ":cloud" suffix.
+// It normalizes explicit cloud source suffixes before checking the shared limit map.
 func lookupCloudModelLimit(name string) (cloudModelLimit, bool) {
-	if l, ok := cloudModelLimits[name]; ok {
-		return l, true
-	}
-	base := strings.TrimSuffix(name, ":cloud")
-	if base != name {
+	base, stripped := modelref.StripCloudSourceTag(name)
+	if stripped {
 		if l, ok := cloudModelLimits[base]; ok {
 			return l, true
 		}
@@ -69,6 +48,16 @@ func (o *OpenCode) Run(model string, args []string) error {
 	models := []string{model}
 	if config, err := loadIntegration("opencode"); err == nil && len(config.Models) > 0 {
 		models = config.Models
+	}
+	var err error
+	models, err = resolveEditorModels("opencode", models, func() ([]string, error) {
+		return selectModels(context.Background(), "opencode", "")
+	})
+	if errors.Is(err, errCancelled) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 	if err := o.Edit(models); err != nil {
 		return fmt.Errorf("setup failed: %w", err)
@@ -130,11 +119,16 @@ func (o *OpenCode) Edit(modelList []string) error {
 	if !ok {
 		ollama = map[string]any{
 			"npm":  "@ai-sdk/openai-compatible",
-			"name": "Ollama (local)",
+			"name": "Ollama",
 			"options": map[string]any{
 				"baseURL": envconfig.Host().String() + "/v1",
 			},
 		}
+	}
+
+	// Migrate legacy provider name
+	if name, _ := ollama["name"].(string); name == "Ollama (local)" {
+		ollama["name"] = "Ollama"
 	}
 
 	models, ok := ollama["models"].(map[string]any)
@@ -155,8 +149,6 @@ func (o *OpenCode) Edit(modelList []string) error {
 		}
 	}
 
-	client, _ := api.ClientFromEnvironment()
-
 	for _, model := range modelList {
 		if existing, ok := models[model].(map[string]any); ok {
 			// migrate existing models without _launch marker
@@ -166,7 +158,7 @@ func (o *OpenCode) Edit(modelList []string) error {
 					existing["name"] = strings.TrimSuffix(name, " [Ollama]")
 				}
 			}
-			if isCloudModel(context.Background(), client, model) {
+			if isCloudModelName(model) {
 				if l, ok := lookupCloudModelLimit(model); ok {
 					existing["limit"] = map[string]any{
 						"context": l.Context,
@@ -180,7 +172,7 @@ func (o *OpenCode) Edit(modelList []string) error {
 			"name":    model,
 			"_launch": true,
 		}
-		if isCloudModel(context.Background(), client, model) {
+		if isCloudModelName(model) {
 			if l, ok := lookupCloudModelLimit(model); ok {
 				entry["limit"] = map[string]any{
 					"context": l.Context,
